@@ -1,0 +1,1566 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TeleportService = game:GetService("TeleportService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local Assets = ReplicatedStorage:WaitForChild("Assets")
+local PlantsFolder = Assets:WaitForChild("Plants")
+local BrainrotsAssets = Assets:WaitForChild("Animations"):WaitForChild("Brainrots")
+local MutationGradients = Assets:WaitForChild("MutationGradients")
+local GearsFolder = Assets:WaitForChild("Gears")
+local EggsFolder = Assets:WaitForChild("Eggs")
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local NotificationEvent = Remotes:WaitForChild("Notification")
+
+local ScriptedMap = workspace:WaitForChild("ScriptedMap")
+local FuseMachine = ScriptedMap:WaitForChild("FuseMachine")
+local PlacePlantPart = FuseMachine:WaitForChild("PlacePlant")
+local PlaceBrainrotPart = FuseMachine:WaitForChild("PlaceBrainrot")
+local ConfirmPart = FuseMachine:WaitForChild("Confirm")
+
+local FuseUIFolder = FuseMachine:WaitForChild("UI")
+local FuseGUI = FuseUIFolder:WaitForChild("GUI")
+local TimerLabel = FuseGUI:WaitForChild("Timer")
+
+local MutationMachine = ScriptedMap:WaitForChild("MutationMachine")
+local MutationPlaceA = MutationMachine:WaitForChild("PlaceA")
+local MutationPlaceB = MutationMachine:WaitForChild("PlaceB")
+local MutationPlaceEXP = MutationMachine:WaitForChild("PlaceEXP")
+local MutationConfirmPart = MutationMachine:WaitForChild("Confirm")
+local MutationUIFolder = MutationMachine:WaitForChild("UI")
+local MutationGUI = MutationUIFolder:WaitForChild("GUI")
+local MutationTimerLabel = MutationGUI:WaitForChild("Timer")
+local MutationUIBar = MutationMachine:WaitForChild("UIBAR")
+local MutationXPPrompt = MutationUIBar:WaitForChild("XPPrompt")
+
+local MUTATION_PROMPT_PLACE = "Place Plant or Brainrot"
+local MUTATION_PROMPT_PICKUP = "Pick Up"
+
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+local Window = Rayfield:CreateWindow({
+	Name = "PVB Test Harness",
+	LoadingTitle = "PVB Test Environment",
+	LoadingSubtitle = "Auto Fuse Brainrots",
+	ShowText = "PVB Test",
+	ToggleUIKeybind = "P",
+})
+
+local AutoTab = Window:CreateTab("Auto", 4483362458)
+
+local autoFuse = {
+	enabled = false,
+	running = false,
+	selectedPlant = nil,
+	availablePlants = {},
+	plantSet = {},
+	brainrotNames = {},
+	brainrotSet = {},
+	requiredBrainrot = nil,
+	timerText = nil,
+	lastStatus = "Idle",
+	lastError = nil,
+	notificationConn = nil,
+	plantPromptText = nil,
+	brainrotPromptText = nil,
+	promptWatcherConn = nil,
+	lastPromptSample = 0,
+	waitUntilBrainrot = false,
+	brainrotWatcherConn = nil,
+	rewardWaitSeconds = 15,
+}
+
+local mutationAutomation
+
+local function toVectorArg(v3)
+	if typeof(v3) == "Vector3" then
+		local vectorLib = rawget(_G, "vector")
+		if vectorLib and typeof(vectorLib.create) == "function" then
+			return vectorLib.create(v3.X, v3.Y, v3.Z)
+		end
+	end
+	return v3
+end
+
+local function isEggName(name)
+	name = tostring(name or "")
+	if name == "" then
+		return false
+	end
+	return EggsFolder:FindFirstChild(name) ~= nil
+end
+
+local function parseMutationString(tool, baseName)
+	if not tool then
+		return nil
+	end
+	local s = tostring(tool:GetAttribute("MutationString") or "")
+	if s == "" then
+		return nil
+	end
+	local itemName = tostring(baseName or tool:GetAttribute("ItemName") or tool.Name or "")
+	local itemLower = itemName:lower()
+	s = s:gsub("%[.-%]", "")
+	s = s:gsub("^%s*Mutation[:%s]+", "")
+	local part = s:match("^(.-)%+%s*.*$") or s
+	if itemLower ~= "" then
+		local function removeCaseInsensitive(hay)
+			local src = hay
+			while true do
+				local i = src:lower():find(itemLower, 1, true)
+				if not i then break end
+				src = src:sub(1, i - 1) .. src:sub(i + #itemName)
+			end
+			return src
+		end
+		part = removeCaseInsensitive(part)
+	end
+	part = part:gsub("[|%-]+$", "")
+	part = part:gsub("%s+", " ")
+	part = part:match("^%s*(.-)%s*$") or part
+	return (part ~= "" and part) or nil
+end
+
+local function getToolMutationName(tool, baseName)
+	if not (tool and tool:IsA("Tool")) then
+		return nil
+	end
+	local attrNames = { "Mutation", "MutationName", "MutationType" }
+	for _, attr in ipairs(attrNames) do
+		local value = tool:GetAttribute(attr)
+		if typeof(value) == "string" and value ~= "" then
+			return value
+		end
+	end
+	return parseMutationString(tool, baseName)
+end
+
+local function buildPlantList()
+	table.clear(autoFuse.availablePlants)
+	table.clear(autoFuse.plantSet)
+
+	local function collect(folder)
+		for _, child in ipairs(folder:GetChildren()) do
+			if child:IsA("Folder") then
+				collect(child)
+			elseif child:IsA("Model") or child:IsA("Tool") or child:IsA("Part") then
+				local name = tostring(child.Name)
+				if not autoFuse.plantSet[name] then
+					table.insert(autoFuse.availablePlants, name)
+					autoFuse.plantSet[name] = true
+				end
+			end
+		end
+	end
+
+	collect(PlantsFolder)
+	table.sort(autoFuse.availablePlants)
+end
+
+local function buildBrainrotList()
+	table.clear(autoFuse.brainrotNames)
+	table.clear(autoFuse.brainrotSet)
+	for _, child in ipairs(BrainrotsAssets:GetChildren()) do
+		local name = child.Name
+		if not isEggName(name) and not autoFuse.brainrotSet[name] then
+			autoFuse.brainrotSet[name] = true
+			table.insert(autoFuse.brainrotNames, name)
+		end
+	end
+	table.sort(autoFuse.brainrotNames)
+end
+
+local function cloneArray(list)
+	local new = {}
+	for i = 1, #list do
+		new[i] = list[i]
+	end
+	return new
+end
+
+local mutationOptionScratch = {}
+local function buildMutationOptions()
+	table.clear(mutationOptionScratch)
+	for _, gradient in ipairs(MutationGradients:GetChildren()) do
+		table.insert(mutationOptionScratch, tostring(gradient.Name))
+	end
+	table.sort(mutationOptionScratch)
+	return cloneArray(mutationOptionScratch)
+end
+
+local expItemScratch = {}
+local function buildExpItemOptions()
+	table.clear(expItemScratch)
+	local seen = {}
+	local function collect(folder)
+		for _, child in ipairs(folder:GetChildren()) do
+			if child:IsA("Folder") then
+				collect(child)
+			elseif child:IsA("Tool") then
+				local name = tostring(child.Name or "")
+				if name ~= "" and string.find(string.lower(name), "exp", 1, true) then
+					if not seen[name] then
+						table.insert(expItemScratch, name)
+						seen[name] = true
+					end
+				end
+			end
+		end
+	end
+	collect(GearsFolder)
+	table.sort(expItemScratch)
+	return cloneArray(expItemScratch)
+end
+
+buildPlantList()
+buildBrainrotList()
+
+local function isKnownBrainrot(name)
+	if not name or name == "" then
+		return false
+	end
+	if autoFuse.brainrotSet[name] then
+		return true
+	end
+	local found = BrainrotsAssets:FindFirstChild(name, true)
+	if found then
+		autoFuse.brainrotSet[name] = true
+		return true
+	end
+	return false
+end
+
+local function findBrainrotInText(text)
+	if not text or text == "" then
+		return nil
+	end
+	for name in pairs(autoFuse.brainrotSet) do
+		if string.find(text, name, 1, true) then
+			return name
+		end
+	end
+	return nil
+end
+
+local function mutationParseTimer()
+	local text = tostring(MutationTimerLabel.Text or "")
+	local minute, second = text:match("Time Remaining:%s*<font[^>]*>(%d+):(%d+)<")
+	if minute and second then
+		return tonumber(minute) or 0, tonumber(second) or 0
+	end
+	local plainMin, plainSec = text:match("Time Remaining:%s*(%d+):(%d+)")
+	if plainMin and plainSec then
+		return tonumber(plainMin) or 0, tonumber(plainSec) or 0
+	end
+	return nil, nil
+end
+
+local function mutationDeriveStage(placedA, placedB)
+	if not (placedA and placedB) then
+		return "placing"
+	end
+	local xpPrompt = MutationXPPrompt
+	if xpPrompt and xpPrompt.Enabled ~= false then
+		return "feeding"
+	end
+	local confirmPrompt = MutationConfirmPart:FindFirstChildWhichIsA("ProximityPrompt")
+	if confirmPrompt then
+		if confirmPrompt.Enabled ~= false then
+			return "readyToConfirm"
+		end
+	end
+	local min, sec = mutationParseTimer()
+	if min and sec then
+		if min > 0 or sec > 0 then
+			return "running"
+		end
+	end
+	return "waitingReward"
+end
+
+local function getBackpack()
+	return LocalPlayer and LocalPlayer:FindFirstChild("Backpack")
+end
+
+local function getHumanoid()
+	local character = LocalPlayer and LocalPlayer.Character
+	return character and character:FindFirstChildOfClass("Humanoid")
+end
+
+local function getRoot()
+	local character = LocalPlayer and LocalPlayer.Character
+	if not character then
+		return nil
+	end
+	return character:FindFirstChild("HumanoidRootPart")
+end
+
+local function mutationFindInventoryMatches(targetName, mutationFilters)
+	local entries = {}
+	local selectedLower = {}
+	if mutationFilters then
+		for _, mu in ipairs(mutationFilters) do
+			local lowered = string.lower(tostring(mu or ""))
+			if lowered ~= "" then
+				selectedLower[lowered] = true
+			end
+		end
+	end
+
+	local function resolveSelectedMatch(mutationLower)
+		if next(selectedLower) == nil then
+			return mutationLower
+		end
+		for key in pairs(selectedLower) do
+			if mutationLower == key or mutationLower:find(key, 1, true) or key:find(mutationLower, 1, true) then
+				return key
+			end
+		end
+		return nil
+	end
+
+	local function considerTool(tool)
+		if not (tool and tool:IsA("Tool")) then
+			return
+		end
+		local baseName = tool:GetAttribute("ItemName") or tool.Name
+		if string.lower(tostring(baseName or "")) ~= string.lower(tostring(targetName or "")) then
+			return
+		end
+		local mutationName = getToolMutationName(tool, baseName)
+		if not mutationName then
+			return
+		end
+		local mutationLower = string.lower(mutationName)
+		local matchedKey = resolveSelectedMatch(mutationLower)
+		if matchedKey then
+			table.insert(entries, {
+				tool = tool,
+				mutation = matchedKey,
+				raw = mutationLower,
+			})
+		end
+	end
+
+	local function scanContainer(container)
+		if not container then
+			return
+		end
+		for _, child in ipairs(container:GetChildren()) do
+			considerTool(child)
+		end
+	end
+
+	scanContainer(LocalPlayer and LocalPlayer.Character)
+	scanContainer(getBackpack())
+	return entries
+end
+
+local statusParagraph = AutoTab:CreateParagraph({
+	Title = "Auto Fuse Brainrots",
+	Content = "Select a plant to begin",
+})
+
+local function formatStatus(message)
+	local lines = {}
+	table.insert(lines, "Selected Plant: " .. (autoFuse.selectedPlant or "None"))
+	table.insert(lines, "Required Brainrot: " .. (autoFuse.requiredBrainrot or "?"))
+	table.insert(lines, "Plant Prompt: " .. (autoFuse.plantPromptText or "N/A"))
+	table.insert(lines, "Brainrot Prompt: " .. (autoFuse.brainrotPromptText or "N/A"))
+	table.insert(lines, "Wait for Brainrot: " .. (autoFuse.waitUntilBrainrot and "Enabled" or "Disabled"))
+	if autoFuse.timerText then
+		table.insert(lines, "Timer: " .. autoFuse.timerText)
+	else
+		table.insert(lines, "Timer: N/A")
+	end
+	if autoFuse.lastError then
+		table.insert(lines, "Error: " .. autoFuse.lastError)
+	end
+	table.insert(lines, "Status: " .. (message or autoFuse.lastStatus or ""))
+	return table.concat(lines, "\n")
+end
+
+local function updateStatus(message)
+	autoFuse.lastStatus = message or autoFuse.lastStatus
+	statusParagraph:Set({
+		Title = "Auto Fuse Brainrots",
+		Content = formatStatus(autoFuse.lastStatus),
+	})
+end
+
+local function setPromptText(kind, text)
+	local changed = false
+	if kind == "plant" then
+		if autoFuse.plantPromptText ~= text then
+			autoFuse.plantPromptText = text
+			changed = true
+		end
+	elseif kind == "brainrot" then
+		if autoFuse.brainrotPromptText ~= text then
+			autoFuse.brainrotPromptText = text
+			changed = true
+		end
+	end
+	return changed
+end
+
+local function describePrompt(prompt)
+	if not prompt then
+		return "Prompt missing"
+	end
+	local text = prompt.ActionText or "?"
+	if prompt.Enabled == false then
+		text = text .. " (disabled)"
+	end
+	return text
+end
+
+local function toolMatchesName(tool, targetName, requireItemAttr)
+	if not (tool and tool:IsA("Tool")) then
+		return false
+	end
+	local itemName = tool:GetAttribute("ItemName")
+	if itemName and string.lower(tostring(itemName)) == string.lower(targetName) then
+		return true
+	end
+	if requireItemAttr then
+		return false
+	end
+	local toolName = tool.Name or ""
+	if string.lower(toolName) == string.lower(targetName) then
+		return true
+	end
+	return false
+end
+
+local function findToolByName(targetName, requireItemAttr)
+	local character = LocalPlayer and LocalPlayer.Character
+	if character then
+		for _, inst in ipairs(character:GetChildren()) do
+			if toolMatchesName(inst, targetName, requireItemAttr) then
+				return inst, character
+			end
+		end
+	end
+
+	local backpack = getBackpack()
+	if backpack then
+		for _, inst in ipairs(backpack:GetChildren()) do
+			if toolMatchesName(inst, targetName, requireItemAttr) then
+				return inst, backpack
+			end
+		end
+	end
+
+	return nil, nil
+end
+
+local function equipTool(tool)
+	local humanoid = getHumanoid()
+	if not (humanoid and tool) then
+		return false
+	end
+
+	local ok = pcall(function()
+		humanoid:EquipTool(tool)
+	end)
+
+	if ok then
+		task.wait(0.1)
+	end
+
+	return ok
+end
+
+local function teleportTo(part)
+	local root = getRoot()
+	if not (root and part and part:IsA("BasePart")) then
+		return false
+	end
+
+	local destination = part.CFrame + part.CFrame.LookVector * 2
+	destination = destination + Vector3.new(0, 2, 0)
+
+	local ok = pcall(function()
+		root.CFrame = destination
+	end)
+
+	if not ok then
+		ok = pcall(function()
+			LocalPlayer.Character:SetPrimaryPartCFrame(destination)
+		end)
+	end
+
+	if ok then
+		task.wait(0.2)
+	end
+
+	return ok
+end
+
+local function firePrompt(prompt)
+	if not prompt then
+		return false
+	end
+
+	local ok = pcall(function()
+		fireproximityprompt(prompt)
+	end)
+
+	if ok then
+		task.wait(0.25)
+	end
+
+	return ok
+end
+
+local function waitForPromptAction(prompt, desiredText, timeout, kind)
+	if not (prompt and typeof(desiredText) == "string") then
+		local changed = setPromptText(kind, "Prompt not found")
+		if changed then
+			updateStatus(autoFuse.lastStatus)
+		end
+		return false
+	end
+
+	local deadline = tick() + (timeout or 5)
+	while tick() < deadline do
+		local currentText = prompt.ActionText
+		local changed = setPromptText(kind, describePrompt(prompt))
+		if changed then
+			updateStatus(autoFuse.lastStatus)
+		end
+		if currentText == desiredText and prompt.Enabled ~= false then
+			setPromptText(kind, desiredText)
+			return true
+		end
+		task.wait(0.1)
+	end
+
+	setPromptText(kind, describePrompt(prompt))
+	return false
+end
+
+local function waitForPromptActionText(promptPart, desiredTexts, timeout)
+	local checks = {}
+	if type(desiredTexts) == "table" then
+		for _, item in ipairs(desiredTexts) do
+			if item and item ~= "" then
+				table.insert(checks, string.lower(tostring(item)))
+			end
+		end
+	elseif type(desiredTexts) == "string" and desiredTexts ~= "" then
+		checks = { string.lower(desiredTexts) }
+	end
+
+	local deadline = tick() + (timeout or 3)
+	while tick() < deadline do
+		local prompt = promptPart and promptPart:FindFirstChildWhichIsA("ProximityPrompt")
+		if prompt then
+			local enabled = prompt.Enabled ~= false
+			local actionLower = string.lower(prompt.ActionText or "")
+			local matches = false
+			if #checks == 0 then
+				matches = enabled
+			else
+				if enabled then
+					for _, target in ipairs(checks) do
+						if actionLower == target or actionLower:find(target, 1, true) then
+							matches = true
+							break
+						end
+					end
+				end
+			end
+			if matches then
+				return prompt
+			end
+		end
+		task.wait(0.1)
+	end
+	return nil
+end
+
+local function mutationIsPromptInPickUp(promptPart, timeout)
+	local prompt = waitForPromptActionText(promptPart, MUTATION_PROMPT_PICKUP, timeout or 0.5)
+	return prompt ~= nil
+end
+
+local function mutationResetPlacements()
+	mutationAutomation.placements.A = false
+	mutationAutomation.placements.B = false
+end
+
+local function mutationRefreshPlacements()
+	local aPlaced = mutationIsPromptInPickUp(MutationPlaceA, 0.1)
+	local bPlaced = mutationIsPromptInPickUp(MutationPlaceB, 0.1)
+	mutationAutomation.placements.A = aPlaced
+	mutationAutomation.placements.B = bPlaced
+	return aPlaced, bPlaced
+end
+
+local function refreshPromptTexts(forceUpdate)
+	local plantPrompt = PlacePlantPart:FindFirstChildWhichIsA("ProximityPrompt")
+	local brainrotPrompt = PlaceBrainrotPart:FindFirstChildWhichIsA("ProximityPrompt")
+
+	local changed = false
+	changed = setPromptText("plant", describePrompt(plantPrompt)) or changed
+	changed = setPromptText("brainrot", describePrompt(brainrotPrompt)) or changed
+
+	if forceUpdate or changed then
+		updateStatus(autoFuse.lastStatus)
+	end
+end
+
+local function startPromptWatcher()
+	if autoFuse.promptWatcherConn then
+		autoFuse.promptWatcherConn:Disconnect()
+	end
+	autoFuse.lastPromptSample = 0
+	refreshPromptTexts(true)
+	autoFuse.promptWatcherConn = RunService.Heartbeat:Connect(function()
+		if not autoFuse.enabled then
+			return
+		end
+		local now = tick()
+		if now - autoFuse.lastPromptSample >= 0.2 then
+			autoFuse.lastPromptSample = now
+			refreshPromptTexts(false)
+		end
+	end)
+end
+
+local function stopPromptWatcher()
+	if autoFuse.promptWatcherConn then
+		autoFuse.promptWatcherConn:Disconnect()
+		autoFuse.promptWatcherConn = nil
+	end
+end
+
+
+local function detectRequiredBrainrot(timeout)
+	local deadline = tick() + (timeout or 6)
+	task.wait(0.2)
+	while tick() < deadline do
+		for _, inst in ipairs(FuseMachine:GetDescendants()) do
+			local name = inst.Name
+			if isKnownBrainrot(name) then
+				return name
+			end
+			if inst:IsA("StringValue") or inst:IsA("ObjectValue") then
+				local value = inst.Value
+				if typeof(value) == "string" and isKnownBrainrot(value) then
+					return value
+				end
+			end
+			if inst:IsA("TextLabel") or inst:IsA("TextBox") or inst:IsA("TextButton") then
+				local match = findBrainrotInText(inst.Text)
+				if match then
+					return match
+				end
+			end
+			local attributes = inst:GetAttributes()
+			for _, attrValue in pairs(attributes) do
+				if typeof(attrValue) == "string" and isKnownBrainrot(attrValue) then
+					return attrValue
+				end
+			end
+		end
+		task.wait(0.25)
+	end
+	return nil
+end
+
+local function startBrainrotWatcher()
+	if autoFuse.brainrotWatcherConn then
+		autoFuse.brainrotWatcherConn:Disconnect()
+	end
+	autoFuse.brainrotWatcherConn = RunService.Heartbeat:Connect(function()
+		if not autoFuse.enabled then
+			return
+		end
+		local detected = detectRequiredBrainrot(0.1)
+		if detected and detected ~= autoFuse.requiredBrainrot then
+			autoFuse.requiredBrainrot = detected
+			updateStatus("Required brainrot updated")
+		end
+	end)
+end
+
+local function stopBrainrotWatcher()
+	if autoFuse.brainrotWatcherConn then
+		autoFuse.brainrotWatcherConn:Disconnect()
+		autoFuse.brainrotWatcherConn = nil
+	end
+end
+
+local function waitForTimerCompletion(maxWait)
+	local deadline = tick() + (maxWait or 120)
+	local seenTimer = false
+	while tick() < deadline do
+		local text = TimerLabel.Text or ""
+		autoFuse.timerText = text
+
+		if string.find(text, "Time Remaining", 1, true) then
+			seenTimer = true
+			updateStatus("Fusing...")
+			if string.find(text, "00:00", 1, true) then
+				break
+			end
+		elseif seenTimer then
+			-- Timer finished and UI cleared
+			break
+		else
+			-- Haven't seen the timer yet, keep waiting silently
+		end
+
+		task.wait(0.5)
+		if not autoFuse.enabled then
+			return
+		end
+	end
+	autoFuse.timerText = nil
+end
+
+local function isFuseActive()
+	local text = TimerLabel.Text or ""
+	if string.find(text, "Time Remaining", 1, true) then
+		return true, text
+	end
+	return false, text
+end
+
+local function handleNotification(data)
+	if typeof(data) == "table" then
+		local text = data.Text or ""
+		if text == "You can't fuse this plant!" then
+			autoFuse.lastError = text
+			autoFuse.enabled = false
+		end
+	end
+end
+
+local function connectNotifications()
+	if autoFuse.notificationConn then
+		autoFuse.notificationConn:Disconnect()
+	end
+	autoFuse.notificationConn = NotificationEvent.OnClientEvent:Connect(handleNotification)
+end
+
+local function disconnectNotifications()
+	if autoFuse.notificationConn then
+		autoFuse.notificationConn:Disconnect()
+		autoFuse.notificationConn = nil
+	end
+end
+
+local function stopAutoFuse()
+	autoFuse.enabled = false
+	autoFuse.running = false
+	disconnectNotifications()
+	stopPromptWatcher()
+	stopBrainrotWatcher()
+	updateStatus("Disabled")
+end
+
+local function autoFuseLoop()
+	if autoFuse.running then
+		return
+	end
+
+	autoFuse.running = true
+	autoFuse.lastError = nil
+	connectNotifications()
+	startPromptWatcher()
+	startBrainrotWatcher()
+
+	task.spawn(function()
+		while autoFuse.enabled do
+			local activeFuse, timerText = isFuseActive()
+			if activeFuse then
+				autoFuse.timerText = timerText
+				updateStatus("Existing fuse detected")
+				waitForTimerCompletion(180)
+				if not autoFuse.enabled then
+					break
+				end
+				updateStatus("Waiting for rewards")
+				task.wait(autoFuse.rewardWaitSeconds)
+				autoFuse.timerText = nil
+				if not autoFuse.enabled then
+					break
+				end
+				continue
+			end
+
+			if not autoFuse.selectedPlant then
+				updateStatus("Select a plant to fuse")
+				task.wait(1)
+				continue
+			end
+
+			autoFuse.requiredBrainrot = nil
+			autoFuse.lastError = nil
+			updateStatus("Locating plant tool")
+
+			local plantTool = select(1, findToolByName(autoFuse.selectedPlant, true))
+			if not plantTool then
+				updateStatus("Plant not found in inventory")
+				task.wait(1.5)
+				continue
+			end
+
+			updateStatus("Equipping plant")
+			equipTool(plantTool)
+
+			updateStatus("Placing plant")
+			teleportTo(PlacePlantPart)
+			local placePlantPrompt = PlacePlantPart:FindFirstChildWhichIsA("ProximityPrompt")
+			setPromptText("plant", describePrompt(placePlantPrompt))
+			firePrompt(placePlantPrompt)
+
+			if not waitForPromptAction(placePlantPrompt, "Pick Up Plant", 6, "plant") then
+				updateStatus("Plant placement not confirmed")
+				task.wait(1.5)
+				continue
+			end
+
+			if autoFuse.lastError then
+				updateStatus(autoFuse.lastError)
+				break
+			end
+
+			autoFuse.requiredBrainrot = detectRequiredBrainrot(8)
+			if not autoFuse.requiredBrainrot then
+				updateStatus("Failed to detect required brainrot")
+				task.wait(1.5)
+				continue
+			end
+
+			updateStatus("Need brainrot: " .. autoFuse.requiredBrainrot)
+
+			local brainrotTool = select(1, findToolByName(autoFuse.requiredBrainrot, true))
+			if not brainrotTool then
+				updateStatus("Missing brainrot: " .. autoFuse.requiredBrainrot)
+				if autoFuse.waitUntilBrainrot then
+					while autoFuse.enabled do
+						task.wait(1)
+						brainrotTool = select(1, findToolByName(autoFuse.requiredBrainrot, true))
+						if brainrotTool then
+							updateStatus("Brainrot located: " .. autoFuse.requiredBrainrot)
+							break
+						end
+						updateStatus("Waiting for brainrot: " .. autoFuse.requiredBrainrot)
+					end
+					if not brainrotTool then
+						break
+					end
+				else
+					autoFuse.lastError = "Missing brainrot: " .. autoFuse.requiredBrainrot
+					autoFuse.enabled = false
+					break
+				end
+			end
+
+			updateStatus("Equipping brainrot")
+			equipTool(brainrotTool)
+
+			updateStatus("Placing brainrot")
+			teleportTo(PlaceBrainrotPart)
+			local placeBrainrotPrompt = PlaceBrainrotPart:FindFirstChildWhichIsA("ProximityPrompt")
+			setPromptText("brainrot", describePrompt(placeBrainrotPrompt))
+			firePrompt(placeBrainrotPrompt)
+
+			if not waitForPromptAction(placeBrainrotPrompt, "Pick Up Brainrot", 6, "brainrot") then
+				updateStatus("Brainrot placement not confirmed")
+				task.wait(1.5)
+				continue
+			end
+
+			while autoFuse.enabled do
+				local plantPromptState = PlacePlantPart:FindFirstChildWhichIsA("ProximityPrompt")
+				local brainrotPromptState = PlaceBrainrotPart:FindFirstChildWhichIsA("ProximityPrompt")
+				local plantEnabled = plantPromptState and plantPromptState.Enabled ~= false
+				local brainrotEnabled = brainrotPromptState and brainrotPromptState.Enabled ~= false
+				local plantReady = plantEnabled and plantPromptState and plantPromptState.ActionText == "Pick Up Plant"
+				local brainrotReady = brainrotEnabled and brainrotPromptState and brainrotPromptState.ActionText == "Pick Up Brainrot"
+				setPromptText("plant", describePrompt(plantPromptState))
+				setPromptText("brainrot", describePrompt(brainrotPromptState))
+
+				if plantReady and brainrotReady then
+					break
+				end
+
+				if not plantReady then
+					updateStatus("Re-placing plant")
+					local retryPlantTool = select(1, findToolByName(autoFuse.selectedPlant, true))
+					if not retryPlantTool then
+						autoFuse.lastError = "Plant not found for re-placement"
+						autoFuse.enabled = false
+						break
+					end
+					updateStatus("Equipping plant")
+					equipTool(retryPlantTool)
+					updateStatus("Placing plant")
+					teleportTo(PlacePlantPart)
+					local retryPlantPrompt = PlacePlantPart:FindFirstChildWhichIsA("ProximityPrompt")
+					setPromptText("plant", describePrompt(retryPlantPrompt))
+					firePrompt(retryPlantPrompt)
+					if not waitForPromptAction(retryPlantPrompt, "Pick Up Plant", 6, "plant") then
+						updateStatus("Plant placement not confirmed")
+						task.wait(1.5)
+					end
+				end
+
+				if autoFuse.enabled and not brainrotReady then
+					updateStatus("Re-placing brainrot")
+					if not brainrotTool or not brainrotTool.Parent then
+						brainrotTool = select(1, findToolByName(autoFuse.requiredBrainrot, true))
+					end
+					if not brainrotTool then
+						if autoFuse.waitUntilBrainrot then
+							updateStatus("Waiting for brainrot: " .. autoFuse.requiredBrainrot)
+							while autoFuse.enabled and not brainrotTool do
+								task.wait(1)
+								brainrotTool = select(1, findToolByName(autoFuse.requiredBrainrot, true))
+							end
+							if not brainrotTool then
+								autoFuse.lastError = "Missing brainrot: " .. autoFuse.requiredBrainrot
+								autoFuse.enabled = false
+								break
+							end
+							updateStatus("Brainrot located: " .. autoFuse.requiredBrainrot)
+						else
+							autoFuse.lastError = "Missing brainrot: " .. autoFuse.requiredBrainrot
+							autoFuse.enabled = false
+							break
+						end
+					end
+					updateStatus("Equipping brainrot")
+					equipTool(brainrotTool)
+					updateStatus("Placing brainrot")
+					teleportTo(PlaceBrainrotPart)
+					local retryBrainrotPrompt = PlaceBrainrotPart:FindFirstChildWhichIsA("ProximityPrompt")
+					setPromptText("brainrot", describePrompt(retryBrainrotPrompt))
+					firePrompt(retryBrainrotPrompt)
+					if not waitForPromptAction(retryBrainrotPrompt, "Pick Up Brainrot", 6, "brainrot") then
+						updateStatus("Brainrot placement not confirmed")
+						task.wait(1.5)
+					end
+				end
+
+				task.wait(0.3)
+			end
+
+			if not autoFuse.enabled then
+				break
+			end
+
+			updateStatus("Confirming fuse")
+			teleportTo(ConfirmPart)
+			firePrompt(ConfirmPart:FindFirstChildWhichIsA("ProximityPrompt"))
+
+			if autoFuse.lastError then
+				updateStatus(autoFuse.lastError)
+				break
+			end
+
+			waitForTimerCompletion(120)
+
+			if not autoFuse.enabled then
+				break
+			end
+
+			updateStatus("Waiting for rewards")
+			task.wait(autoFuse.rewardWaitSeconds)
+		end
+
+		disconnectNotifications()
+		stopPromptWatcher()
+		stopBrainrotWatcher()
+		autoFuse.running = false
+
+		if autoFuse.lastError then
+			updateStatus(autoFuse.lastError)
+		elseif not autoFuse.enabled then
+			updateStatus("Disabled")
+		else
+			updateStatus("Stopped")
+		end
+	end)
+end
+
+local Dropdown = AutoTab:CreateDropdown({
+	Name = "Select Plant",
+	Options = autoFuse.availablePlants,
+	CurrentOption = (#autoFuse.availablePlants > 0) and {autoFuse.availablePlants[1]} or {"(none found)"},
+	MultipleOptions = false,
+	Callback = function(optionList)
+		autoFuse.selectedPlant = optionList and optionList[1] or nil
+		if autoFuse.selectedPlant == "(none found)" then
+			autoFuse.selectedPlant = nil
+		end
+		updateStatus("Selected plant updated")
+	end,
+})
+
+AutoTab:CreateToggle({
+	Name = "Enable Auto Fuse",
+	CurrentValue = false,
+	Flag = "AutoFuse",
+	Callback = function(state)
+		autoFuse.enabled = state and true or false
+		if autoFuse.enabled then
+			autoFuse.lastError = nil
+			updateStatus("Starting...")
+			startPromptWatcher()
+			startBrainrotWatcher()
+			autoFuseLoop()
+		else
+			stopAutoFuse()
+		end
+	end,
+})
+
+AutoTab:CreateToggle({
+	Name = "Wait Until Brainrot Available",
+	CurrentValue = autoFuse.waitUntilBrainrot,
+	Flag = "AutoFuse_WaitBrainrot",
+	Callback = function(state)
+		autoFuse.waitUntilBrainrot = state and true or false
+		updateStatus("Updated wait setting")
+	end,
+})
+
+updateStatus("Idle")
+
+-- Mutation merge automation state
+mutationAutomation = {
+	enabled = false,
+	running = false,
+	lastStatus = "Idle",
+	lastError = nil,
+	selectedMode = "Brainrots",
+	selectedMutations = {},
+	selectedPlant = nil,
+	selectedBrainrot = nil,
+	selectedExpItems = {},
+	rewardWaitSeconds = 20,
+	statusParagraph = nil,
+	placements = {
+		A = false,
+		B = false,
+	},
+	stage = "idle",
+}
+
+local function mutationFormatStatus(statusMessage)
+	local lines = {}
+	table.insert(lines, "Mode: " .. (mutationAutomation.selectedMode or "?"))
+	local mutList = (#mutationAutomation.selectedMutations > 0) and table.concat(mutationAutomation.selectedMutations, ", ") or "(none)"
+	table.insert(lines, "Mutations: " .. mutList)
+	table.insert(lines, "Plant: " .. (mutationAutomation.selectedPlant or "(none)"))
+	table.insert(lines, "Brainrot: " .. (mutationAutomation.selectedBrainrot or "(none)"))
+	table.insert(lines, "Stage: " .. (mutationAutomation.stage or "(idle)"))
+	local expList = (#mutationAutomation.selectedExpItems > 0) and table.concat(mutationAutomation.selectedExpItems, ", ") or "(none)"
+	table.insert(lines, "EXP Items: " .. expList)
+	if mutationAutomation.lastError then
+		table.insert(lines, "Error: " .. mutationAutomation.lastError)
+	end
+	table.insert(lines, "Status: " .. (statusMessage or mutationAutomation.lastStatus or ""))
+	return table.concat(lines, "\n")
+end
+
+local function mutationUpdateStatus(message, stage)
+    if stage then
+        mutationAutomation.stage = stage
+    end
+    mutationAutomation.lastStatus = message or mutationAutomation.lastStatus
+	if mutationAutomation.statusParagraph then
+		mutationAutomation.statusParagraph:Set({
+			Title = "Mutation Merge",
+			Content = mutationFormatStatus(mutationAutomation.lastStatus),
+		})
+	end
+end
+
+local function mutationModeOptions()
+	return {"Plants", "Brainrots"}
+end
+
+local function mutationSetError(text, stage)
+	mutationAutomation.lastError = text
+	mutationUpdateStatus(text or mutationAutomation.lastStatus, stage or "error")
+end
+
+local function mutationSelectPair(targetName, mutationFilters)
+	local entries = mutationFindInventoryMatches(targetName, mutationFilters)
+	if not entries or #entries == 0 then
+		return nil
+	end
+	local buckets = {}
+	for _, entry in ipairs(entries) do
+		local key = entry.mutation or entry.raw
+		if key then
+			buckets[key] = buckets[key] or {}
+			table.insert(buckets[key], entry.tool)
+		end
+	end
+
+	local orderedKeys = {}
+	local seenKeys = {}
+	if mutationFilters then
+		for _, mu in ipairs(mutationFilters) do
+			local lower = string.lower(tostring(mu or ""))
+			if lower ~= "" and not seenKeys[lower] then
+				seenKeys[lower] = true
+				table.insert(orderedKeys, lower)
+			end
+		end
+	end
+
+	local selectedTools = {}
+	local function takeFromKey(key)
+		local bucket = buckets[key]
+		if bucket and #bucket > 0 then
+			local tool = table.remove(bucket, 1)
+			table.insert(selectedTools, tool)
+			return true
+		end
+		return false
+	end
+
+	for _, key in ipairs(orderedKeys) do
+		if takeFromKey(key) and #selectedTools == 2 then
+			break
+		end
+	end
+
+	if #selectedTools < 2 then
+		for _, bucket in pairs(buckets) do
+			while bucket and #bucket > 0 and #selectedTools < 2 do
+				table.insert(selectedTools, table.remove(bucket, 1))
+			end
+			if #selectedTools == 2 then
+				break
+			end
+		end
+	end
+
+	if #selectedTools >= 2 then
+		return selectedTools[1], selectedTools[2]
+	end
+
+	return nil
+end
+
+local function mutationAcquirePlacementTools(targetName, mutationFilters, needA, needB)
+	if not needA and not needB then
+		return nil, nil
+	end
+	
+	local toolA, toolB = mutationSelectPair(targetName, mutationFilters)
+	
+	if needA and needB then
+		return toolA, toolB
+	elseif needA then
+		return toolA, nil
+	elseif needB then
+		return nil, toolB
+	end
+	
+	return nil, nil
+end
+
+local function mutationWaitForPrompt(prompt, desiredText, timeout)
+	if not prompt then
+		return false
+	end
+	local deadline = tick() + (timeout or 6)
+	while tick() < deadline do
+		if prompt.ActionText == desiredText and prompt.Enabled ~= false then
+			return true
+		end
+		task.wait(0.1)
+	end
+	return false
+end
+
+local function mutationEnsurePromptState(promptPart, desiredText, retries, toolName, mutationFilters)
+	retries = retries or 2
+	for _ = 1, retries do
+		local prompt = waitForPromptActionText(promptPart, desiredText, 1)
+		if prompt then
+			return true
+		end
+		local tool = select(1, findToolByName(toolName, true))
+		if not tool then
+			local matchA, matchB = mutationSelectPair(toolName, mutationFilters)
+			tool = matchA
+		end
+		if tool then
+			equipTool(tool)
+			teleportTo(promptPart)
+			prompt = promptPart:FindFirstChildWhichIsA("ProximityPrompt")
+			firePrompt(prompt)
+			if waitForPromptActionText(promptPart, desiredText, 4) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function mutationConsumeExpItems(expNames)
+	if not expNames or #expNames == 0 then
+		return true
+	end
+	local prompt = MutationXPPrompt
+	if not prompt then
+		return false
+	end
+	local function promptNeedsExp()
+	return prompt.Enabled ~= false
+	end
+	local nameSet = {}
+	for _, n in ipairs(expNames) do
+		nameSet[string.lower(n)] = true
+	end
+	local function findExpTool()
+		local function matches(tool)
+			if not tool:IsA("Tool") then
+				return false
+			end
+			local attr = tool:GetAttribute("ItemName") or tool.Name
+			return attr and nameSet[string.lower(tostring(attr))]
+		end
+		local function scan(container)
+			if not container then
+				return nil
+			end
+			for _, tool in ipairs(container:GetChildren()) do
+				if matches(tool) then
+					return tool
+				end
+			end
+			return nil
+		end
+		return scan(LocalPlayer and LocalPlayer.Character) or scan(getBackpack())
+	end
+	while promptNeedsExp() and mutationAutomation.enabled do
+		local tool = findExpTool()
+		if not tool then
+			mutationSetError("EXP item missing", "feeding")
+			return false
+		end
+		equipTool(tool)
+		teleportTo(MutationPlaceEXP)
+		firePrompt(prompt)
+		task.wait(0.4)
+	end
+	return true
+end
+
+local function mutationWaitForTimer(maxWait)
+	local deadline = tick() + (maxWait or 180)
+	local lastSeen = nil
+	while mutationAutomation.enabled and tick() < deadline do
+		local min, sec = mutationParseTimer()
+		if min and sec then
+			local remaining = min * 60 + sec
+			lastSeen = remaining
+			if remaining <= 0 then
+				break
+			end
+		else
+			if lastSeen and lastSeen <= 0 then
+				break
+			end
+		end
+		task.wait(0.4)
+	end
+end
+
+local function mutationRunLoop()
+	if mutationAutomation.running then
+		return
+	end
+	mutationAutomation.running = true
+	mutationAutomation.lastError = nil
+
+	task.spawn(function()
+		while mutationAutomation.enabled do
+			mutationAutomation.lastError = nil
+			
+			local mode = mutationAutomation.selectedMode or "Brainrots"
+			local targetName = (mode == "Plants") and mutationAutomation.selectedPlant or mutationAutomation.selectedBrainrot
+			if not targetName or targetName == "" then
+				mutationUpdateStatus("Select a target item", "awaitingSelection")
+				task.wait(1)
+				continue
+			end
+
+			if not mutationAutomation.selectedMutations or #mutationAutomation.selectedMutations < 2 then
+				mutationUpdateStatus("Select at least 2 mutations", "awaitingSelection")
+				task.wait(1)
+				continue
+			end
+
+			-- Check current placements
+			local placedA, placedB = mutationRefreshPlacements()
+			local currentStage = mutationDeriveStage(placedA, placedB)
+			mutationAutomation.stage = currentStage
+			
+			-- If both chambers are filled, skip to the next stage
+			if placedA and placedB then
+				mutationUpdateStatus("Chambers already filled", currentStage)
+				
+				-- Handle based on current stage
+				if currentStage == "feeding" then
+					mutationUpdateStatus("Feeding EXP", "feeding")
+					if not mutationConsumeExpItems(mutationAutomation.selectedExpItems) then
+						mutationSetError("EXP feeding incomplete", "feeding")
+						task.wait(1.2)
+						continue
+					end
+				elseif currentStage == "readyToConfirm" then
+					-- Skip to confirmation
+					goto CONFIRM_STEP
+				elseif currentStage == "running" then
+					mutationUpdateStatus("Already running", "running")
+					mutationWaitForTimer(180)
+					if not mutationAutomation.enabled then
+						break
+					end
+					mutationUpdateStatus("Waiting for rewards", "waitingReward")
+					task.wait(mutationAutomation.rewardWaitSeconds)
+					mutationResetPlacements()
+					continue
+				elseif currentStage == "waitingReward" then
+					mutationUpdateStatus("Waiting for rewards", "waitingReward")
+					task.wait(mutationAutomation.rewardWaitSeconds)
+					mutationResetPlacements()
+					continue
+				end
+			else
+				-- Need to place items
+				mutationUpdateStatus("Scanning inventory", "scanning")
+				
+				local needA = not placedA
+				local needB = not placedB
+				
+				local toolA, toolB = mutationAcquirePlacementTools(targetName, mutationAutomation.selectedMutations, needA, needB)
+				
+				if needA and not toolA then
+					mutationUpdateStatus("Need mutated item for chamber A", "placing")
+					task.wait(2)
+					continue
+				end
+				if needB and not toolB then
+					mutationUpdateStatus("Need mutated item for chamber B", "placing")
+					task.wait(2)
+					continue
+				end
+
+				if needA then
+					mutationUpdateStatus("Placing item in chamber A", "placingA")
+					equipTool(toolA)
+					teleportTo(MutationPlaceA)
+					local promptA = MutationPlaceA:FindFirstChildWhichIsA("ProximityPrompt")
+					firePrompt(promptA)
+					local confirmA = waitForPromptActionText(MutationPlaceA, MUTATION_PROMPT_PICKUP, 6)
+					if not confirmA then
+						mutationAutomation.placements.A = false
+						mutationSetError("Place A failed", "placingA")
+						task.wait(1.2)
+						continue
+					end
+					mutationAutomation.placements.A = true
+					placedA = true
+				end
+
+				if needB then
+					local readyBPrompt = waitForPromptActionText(MutationPlaceB, MUTATION_PROMPT_PLACE, 6)
+					if not readyBPrompt then
+						mutationAutomation.placements.B = false
+						mutationSetError("Place B prompt unavailable", "placingB")
+						task.wait(1.2)
+						continue
+					end
+
+					mutationUpdateStatus("Placing item in chamber B", "placingB")
+					equipTool(toolB)
+					teleportTo(MutationPlaceB)
+					local promptB = MutationPlaceB:FindFirstChildWhichIsA("ProximityPrompt")
+					firePrompt(promptB)
+					local confirmB = waitForPromptActionText(MutationPlaceB, MUTATION_PROMPT_PICKUP, 6)
+					if not confirmB then
+						mutationAutomation.placements.B = false
+						mutationSetError("Place B failed", "placingB")
+						task.wait(1.2)
+						continue
+					end
+					mutationAutomation.placements.B = true
+					placedB = true
+				end
+
+				-- Wait for stable prompts
+				local function waitForStablePrompts()
+					local deadline = tick() + 3
+					while tick() < deadline do
+						if mutationIsPromptInPickUp(MutationPlaceA, 0.2) and mutationIsPromptInPickUp(MutationPlaceB, 0.2) then
+							mutationAutomation.placements.A = true
+							mutationAutomation.placements.B = true
+							return true
+						end
+						task.wait(0.1)
+					end
+					return false
+				end
+
+				if not waitForStablePrompts() then
+					mutationUpdateStatus("Waiting for placement stability", "placing")
+					task.wait(1)
+					continue
+				end
+			end
+			
+			mutationUpdateStatus("Chambers secured", mutationDeriveStage(true, true))
+
+			-- Handle EXP feeding
+			local prompt = MutationXPPrompt
+			if prompt and prompt.Enabled ~= false then
+				mutationUpdateStatus("Feeding EXP", "feeding")
+				if not mutationConsumeExpItems(mutationAutomation.selectedExpItems) then
+					mutationSetError("EXP feeding incomplete", "feeding")
+					task.wait(1.2)
+					continue
+				end
+			else
+				mutationUpdateStatus("EXP already full", "readyToConfirm")
+			end
+
+			::CONFIRM_STEP::
+			local confirmPrompt = MutationConfirmPart:FindFirstChildWhichIsA("ProximityPrompt")
+			if not confirmPrompt or confirmPrompt.Enabled == false then
+				mutationSetError("Confirm prompt unavailable", "readyToConfirm")
+				task.wait(1.2)
+				continue
+			end
+
+			mutationUpdateStatus("Confirming mutation", "confirming")
+			teleportTo(MutationConfirmPart)
+			firePrompt(confirmPrompt)
+			task.wait(0.5)
+			
+			if confirmPrompt.Enabled == false then
+				mutationUpdateStatus("Running...", "running")
+			else
+				mutationSetError("Confirm failed", "confirming")
+				task.wait(1.2)
+				continue
+			end
+
+			mutationWaitForTimer(180)
+			if not mutationAutomation.enabled then
+				break
+			end
+			mutationUpdateStatus("Waiting for rewards", "waitingReward")
+			task.wait(mutationAutomation.rewardWaitSeconds)
+			
+			-- Reset placements for next cycle
+			mutationResetPlacements()
+		end
+
+		mutationAutomation.running = false
+		if mutationAutomation.lastError then
+			mutationUpdateStatus(mutationAutomation.lastError, "error")
+		elseif not mutationAutomation.enabled then
+			mutationUpdateStatus("Disabled", "idle")
+		else
+			mutationUpdateStatus("Stopped", "idle")
+		end
+	end)
+end
+
+local mutationSection = AutoTab:CreateSection("Mutation Merge Machine")
+mutationAutomation.statusParagraph = AutoTab:CreateParagraph({
+	Title = "Mutation Merge",
+	Content = mutationFormatStatus("Idle"),
+})
+
+local mutationModeDropdown = AutoTab:CreateDropdown({
+	Name = "Merge Type",
+	Options = mutationModeOptions(),
+	CurrentOption = {mutationAutomation.selectedMode},
+	MultipleOptions = false,
+	Callback = function(options)
+		mutationAutomation.selectedMode = options and options[1] or mutationAutomation.selectedMode
+		mutationUpdateStatus("Mode updated")
+	end,
+})
+
+local mutationSelectionDropdown = AutoTab:CreateDropdown({
+	Name = "Mutations",
+	Options = buildMutationOptions(),
+	MultipleOptions = true,
+	CurrentOption = {},
+	Callback = function(options)
+		mutationAutomation.selectedMutations = options or {}
+		mutationUpdateStatus("Mutations updated")
+	end,
+})
+
+local mutationPlantDropdown = AutoTab:CreateDropdown({
+	Name = "Plant (for plant merges)",
+	Options = cloneArray(autoFuse.availablePlants),
+	MultipleOptions = false,
+	CurrentOption = {},
+	Callback = function(options)
+		mutationAutomation.selectedPlant = options and options[1] or nil
+		mutationUpdateStatus("Plant updated")
+	end,
+})
+
+local mutationBrainrotDropdown = AutoTab:CreateDropdown({
+	Name = "Brainrot (for brainrot merges)",
+	Options = cloneArray(autoFuse.brainrotNames),
+	MultipleOptions = false,
+	CurrentOption = {},
+	Callback = function(options)
+		mutationAutomation.selectedBrainrot = options and options[1] or nil
+		mutationUpdateStatus("Brainrot updated")
+	end,
+})
+
+local mutationExpDropdown = AutoTab:CreateDropdown({
+	Name = "EXP Items",
+	Options = buildExpItemOptions(),
+	MultipleOptions = true,
+	CurrentOption = {},
+	Callback = function(options)
+		mutationAutomation.selectedExpItems = options or {}
+		mutationUpdateStatus("EXP item list updated")
+	end,
+})
+
+local mutationToggle = AutoTab:CreateToggle({
+	Name = "Enable Auto Mutation Merge",
+	CurrentValue = false,
+	Flag = "AutoMutationMerge",
+	Callback = function(state)
+		mutationAutomation.enabled = state and true or false
+		if mutationAutomation.enabled then
+			mutationAutomation.lastError = nil
+			mutationUpdateStatus("Starting...")
+			mutationRunLoop()
+		else
+			mutationUpdateStatus("Disabled")
+		end
+	end,
+})
+
